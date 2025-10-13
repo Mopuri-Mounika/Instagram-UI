@@ -1,0 +1,27 @@
+services:
+  - type: worker
+    name: ig-scraper
+    env: docker
+    plan: starter
+    autoDeploy: false
+    dockerfilePath: Dockerfile
+
+    # Optional: attach a persistent disk so your CSV survives restarts
+    disks:
+      - name: data
+        mountPath: /data
+        sizeGB: 1
+
+    envVars:
+      - key: INSTAGRAM_USERNAME
+        sync: false            # set in Render Dashboard
+      - key: INSTAGRAM_PASSWORD
+        sync: false            # set in Render Dashboard
+      - key: PROFILE_URL
+        value: https://www.instagram.com/srija_sweetiee/
+      - key: START_DATE
+        value: 2025-09-29
+      - key: END_DATE
+        value: 2025-10-10
+      - key: OUTPUT_FILE
+        value: /data/Srija_posts.csv
