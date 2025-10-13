@@ -1,2 +1,4 @@
+flask>=3.0
 selenium>=4.23
 pandas>=2.2
+
