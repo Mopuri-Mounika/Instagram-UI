@@ -1,5 +1,7 @@
-# app.py — Render-friendly Instagram scraper (robust login + date filter)
-# Python 3.11+ recommended
+# app.py — Render Web Service friendly Instagram scraper
+# - Binds to $PORT via Flask (health endpoint) to satisfy Render Web Service
+# - Cookie-first login (INSTAGRAM_SESSIONID, DS_USER_ID), fallback to robust login
+# - Unique Chrome profile per run; container-safe flags
 
 import os
 import atexit
@@ -7,10 +9,13 @@ import time
 import random
 import shutil
 import tempfile
+import threading
 from datetime import datetime
 from typing import Optional, Tuple, List
 
 import pandas as pd
+from flask import Flask, jsonify
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -30,11 +35,15 @@ INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "").strip()
 PROFILE_URL        = os.getenv("PROFILE_URL", "https://www.instagram.com/srija_sweetiee/")
 OUTPUT_FILE        = os.getenv("OUTPUT_FILE", "Srija_posts.csv")
 
+# Cookie-based session (preferred in cloud)
+IG_SESSIONID = os.getenv("INSTAGRAM_SESSIONID", "").strip()
+IG_DS_USERID = os.getenv("DS_USER_ID", "").strip()  # ds_user_id cookie
+
 # Date range (YYYY-M-D or YYYY-MM-DD)
 START_DATE = os.getenv("START_DATE", "2025-09-29")
 END_DATE   = os.getenv("END_DATE",   "2025-10-10")
 
-# Optional: force mobile user-agent (often simpler login flow on cloud IPs)
+# Optional: force mobile user-agent (often simpler flow on cloud IPs)
 USE_MOBILE_UA = True
 
 # =======================
@@ -65,7 +74,7 @@ def make_chrome_options(user_data_dir: str) -> Options:
                      "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
         opts.add_argument(f"--user-agent={MOBILE_UA}")
 
-    chrome_bin = os.getenv("CHROME_PATH")
+    chrome_bin = os.getenv("CHROME_PATH")  # optional if your image provides Chrome
     if chrome_bin:
         opts.binary_location = chrome_bin
 
@@ -107,7 +116,7 @@ def create_driver_with_retry(retries: int = 2) -> Tuple[webdriver.Chrome, str]:
         raise last_err
 
 # =======================
-# Helpers for login flow
+# Helpers
 # =======================
 def safe_click_js(driver: webdriver.Chrome, el):
     driver.execute_script("arguments[0].click();", el)
@@ -144,6 +153,41 @@ def page_ready_after_login(wait: WebDriverWait, extra_timeout: int = 10) -> bool
         return True
     except TimeoutException:
         return False
+
+def cookie_login(driver: webdriver.Chrome, wait: WebDriverWait) -> bool:
+    """Use existing session cookies to bypass form login (most reliable in cloud).
+       Requires INSTAGRAM_SESSIONID and DS_USER_ID env vars.
+    """
+    if not IG_SESSIONID or not IG_DS_USERID:
+        return False
+
+    base = "https://www.instagram.com"
+    driver.get(base)
+    time.sleep(1)
+
+    # Set cookies for the domain and its subdomain (defensive)
+    cookie_params = [
+        {"name": "sessionid", "value": IG_SESSIONID, "domain": ".instagram.com", "path": "/"},
+        {"name": "ds_user_id", "value": IG_DS_USERID, "domain": ".instagram.com", "path": "/"},
+    ]
+    for ck in cookie_params:
+        try:
+            driver.add_cookie(ck)
+        except Exception as e:
+            print(f"⚠️ add_cookie error: {e}")
+
+    driver.get(base)  # refresh with cookies
+    time.sleep(2)
+
+    # Dismiss cookie banners if any
+    try_click_any_text(wait, [
+        "Allow essential cookies", "Only allow essential cookies",
+        "Allow all cookies", "Allow all", "Accept All", "Accept all"
+    ], timeout=3)
+
+    ok = page_ready_after_login(wait, extra_timeout=8)
+    print("✅ Cookie login success" if ok else "⚠️ Cookie login did not reach home UI")
+    return ok
 
 def robust_ig_login(driver: webdriver.Chrome, wait: WebDriverWait, username: str, password: str) -> bool:
     login_urls = [
@@ -183,10 +227,10 @@ def robust_ig_login(driver: webdriver.Chrome, wait: WebDriverWait, username: str
         try:
             user_el.clear(); user_el.send_keys(username)
             pass_el.clear(); pass_el.send_keys(password)
-            pass_el.send_keys(Keys.ENTER)  # works across layouts
+            pass_el.send_keys(Keys.ENTER)
             time.sleep(2.0)
 
-            # If still on page, try click submit
+            # If still on page, try clicking submit
             try:
                 submit = driver.find_element(By.XPATH, '//button[@type="submit" or .//text()[contains(., "Log in")]]')
                 safe_click_js(driver, submit)
@@ -195,7 +239,7 @@ def robust_ig_login(driver: webdriver.Chrome, wait: WebDriverWait, username: str
 
             time.sleep(3)
             # Interstitials
-            try_click_any_text(wait, ["Not now", "Not Now"], timeout=3)
+            try_click_any_text(wait, ["Not now", "Not Now"], timeout=3)  # save login
             try_click_any_text(wait, ["Not now", "Not Now"], timeout=3)  # notifications
 
             if page_ready_after_login(wait, extra_timeout=10):
@@ -214,9 +258,6 @@ def robust_ig_login(driver: webdriver.Chrome, wait: WebDriverWait, username: str
 
     return False
 
-# =======================
-# Scrape helpers
-# =======================
 def get_post_date_iso(driver: webdriver.Chrome) -> Tuple[str, Optional[datetime]]:
     try:
         t = driver.find_element(By.TAG_NAME, "time")
@@ -224,7 +265,6 @@ def get_post_date_iso(driver: webdriver.Chrome) -> Tuple[str, Optional[datetime]
         date_str = iso[:10] if iso else "Unknown"
         dt_obj = None
         if date_str and date_str != "Unknown":
-            # Only the date part for window comparison
             dt_obj = datetime.fromisoformat(date_str)
         return date_str, dt_obj
     except NoSuchElementException:
@@ -253,12 +293,9 @@ def collect_caption_and_comments(article_el) -> List[str]:
             seen.add(s); out.append(s)
     return out
 
-# =======================
-# Main
-# =======================
-def main():
-    if not INSTAGRAM_USERNAME or not INSTAGRAM_PASSWORD:
-        raise SystemExit("Set INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD as environment variables.")
+def scrape_once():
+    """Run one scrape cycle. Designed to run in a background thread while Flask serves /healthz."""
+    print("🚀 Scraper starting…")
 
     # Dates
     start_dt = datetime.strptime(START_DATE, "%Y-%m-%d")
@@ -268,18 +305,31 @@ def main():
     driver, profile_dir = create_driver_with_retry()
     wait = WebDriverWait(driver, 15)
 
-    # Login
-    if not robust_ig_login(driver, wait, INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD):
-        print("❌ Login failed after all attempts. (2FA/checkpoint may require manual action.)")
-        driver.quit()
-        raise SystemExit(1)
+    # Prefer cookie login
+    logged_in = False
+    if IG_SESSIONID and IG_DS_USERID:
+        try:
+            logged_in = cookie_login(driver, wait)
+        except Exception as e:
+            print(f"⚠️ Cookie login error: {e}")
+
+    # Fallback to form login
+    if not logged_in:
+        if not INSTAGRAM_USERNAME or not INSTAGRAM_PASSWORD:
+            print("❌ No cookies and no credentials; cannot log in.")
+            driver.quit()
+            return
+        if not robust_ig_login(driver, wait, INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD):
+            print("❌ Login failed after all attempts. (2FA/checkpoint may require manual action.)")
+            driver.quit()
+            return
 
     # Go to profile
     driver.get(PROFILE_URL)
     print("✅ Profile page loaded")
     time.sleep(4)
 
-    # Open first post (avoid brittle absolute XPaths)
+    # Open first post
     try:
         first_post = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "article a")))
         driver.execute_script("arguments[0].scrollIntoView({behavior:'instant',block:'center'});", first_post)
@@ -291,7 +341,7 @@ def main():
         print(f"⚠️ Error opening first post: {e}")
         driver.save_screenshot("/tmp/click_error.png")
         driver.quit()
-        raise SystemExit(1)
+        return
 
     # Scrape loop
     rows = []
@@ -303,15 +353,12 @@ def main():
         print(f"\n📸 Scraping Post {post_count}")
         post_url = driver.current_url
 
-        # Date
         date_posted, date_obj = get_post_date_iso(driver)
-
-        # Early break if older than window after few posts
         if post_count > 3 and date_obj and date_obj.date() < start_dt.date():
             print(f"🛑 Older than start date ({START_DATE}). Stopping.")
             break
 
-        # Likes (often hidden)
+        # Likes (may be hidden)
         try:
             likes = driver.find_element(By.XPATH, '//section//span//*[contains(text(),"likes")]/..').text
         except NoSuchElementException:
@@ -344,7 +391,6 @@ def main():
 
         # Next post
         try:
-            # Generic "Next" button (SVG aria-label) or last nav button
             next_btn = wait.until(EC.element_to_be_clickable((
                 By.XPATH,
                 '//button[contains(@class,"_abl-")]//*[local-name()="svg" and @aria-label="Next"]/ancestor::button'
@@ -360,7 +406,7 @@ def main():
     if rows:
         df = pd.DataFrame(rows)
         df["Date_filled"] = df["Date"].replace("", pd.NA).ffill()
-        df["URL_filled"] = df["URL"].replace("", pd.NA).ffill()
+        df["URL_filled"]  = df["URL"].replace("", pd.NA).ffill()
 
         def in_window(dstr: str) -> bool:
             if not dstr or dstr == "Unknown":
@@ -381,7 +427,21 @@ def main():
         print("\n⚠️ No data scraped.")
 
     driver.quit()
-    print("\n✅ Completed successfully.")
+    print("\n✅ Scraper finished.")
+
+# =======================
+# Flask app for Render $PORT
+# =======================
+app = Flask(__name__)
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"status": "ok"}), 200
 
 if __name__ == "__main__":
-    main()
+    # Start scraper in background thread so Flask can bind to $PORT
+    t = threading.Thread(target=scrape_once, daemon=True)
+    t.start()
+
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
