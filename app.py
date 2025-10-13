@@ -1,219 +1,311 @@
+# app.py — Render-friendly Selenium setup + your scraper (with unique Chrome profile)
+
 import os
 import time
 import random
-import pandas as pd
+import shutil
+import atexit
+import tempfile
 from datetime import datetime
+
+import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, SessionNotCreatedException
 
 # ===================================
 # CONFIGURATION
 # ===================================
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME") or "adiadiadi1044"
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD") or "Heybro@"
-PROFILE_URL = "https://www.instagram.com/srija_sweetiee/"
-OUTPUT_FILE = "Srija_posts.csv"
+PROFILE_URL = os.getenv("PROFILE_URL") or "https://www.instagram.com/srija_sweetiee/"
+OUTPUT_FILE = os.getenv("OUTPUT_FILE") or "Srija_posts.csv"
 
-# Date range filters
-START_DATE = "2025-9-29"
-END_DATE = "2025-10-10"
-
-chrome_options = Options()
-chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-chrome_options.add_argument("--disable-notifications")
-chrome_options.add_argument("--start-maximized")
-
-service = Service()
-driver = webdriver.Chrome(service=service, options=chrome_options)
-wait = WebDriverWait(driver, 15)
+# Date range filters (YYYY-M-D or YYYY-MM-DD)
+START_DATE = os.getenv("START_DATE") or "2025-9-29"
+END_DATE   = os.getenv("END_DATE")   or "2025-10-10"
 
 # ===================================
-# 1️⃣ LOGIN
+# Chrome / Selenium bootstrap (Render-safe)
 # ===================================
-driver.get("https://www.instagram.com/")
-print("🔄 Opening Instagram...")
 
-try:
-    username_input = wait.until(EC.presence_of_element_located((By.NAME, "username")))
-    password_input = driver.find_element(By.NAME, "password")
-    username_input.send_keys(INSTAGRAM_USERNAME)
-    password_input.send_keys(INSTAGRAM_PASSWORD)
+def make_chrome_options(user_data_dir: str) -> Options:
+    opts = Options()
 
-    login_button = driver.find_element(By.XPATH, '//button[@type="submit"]')
-    login_button.click()
-    print("✅ Logged into Instagram")
-    time.sleep(7)
-except Exception as e:
-    print(f"⚠️ Login error: {e}")
-    driver.quit()
-    exit()
+    # Cloud/container friendly flags
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-notifications")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--window-size=1366,768")
+    opts.add_argument("--start-maximized")
+    opts.add_argument("--mute-audio")
+
+    # Use a UNIQUE user data dir to avoid "already in use" locks
+    opts.add_argument(f"--user-data-dir={user_data_dir}")
+    # Also isolate other storage paths inside the same temp dir
+    opts.add_argument(f"--data-path={os.path.join(user_data_dir,'data')}")
+    opts.add_argument(f"--disk-cache-dir={os.path.join(user_data_dir,'cache')}")
+    opts.add_argument(f"--homedir={user_data_dir}")
+
+    # If your Render service sets CHROME_PATH / CHROMEDRIVER_PATH, respect them
+    chrome_bin = os.getenv("CHROME_PATH")
+    if chrome_bin:
+        opts.binary_location = chrome_bin
+
+    # Prefer English content for more predictable selectors
+    opts.add_argument("--lang=en-US")
+
+    return opts
+
+def create_driver_with_retry(retries: int = 2):
+    """Create a Chrome driver with a fresh temp profile; retry on SessionNotCreated."""
+    last_err = None
+    for attempt in range(1, retries + 2):
+        temp_profile = tempfile.mkdtemp(prefix="chrome-profile-")
+        def _cleanup():
+            try:
+                shutil.rmtree(temp_profile, ignore_errors=True)
+            except Exception:
+                pass
+        atexit.register(_cleanup)
+
+        options = make_chrome_options(temp_profile)
+
+        try:
+            service = Service()  # Selenium Manager will fetch chromedriver
+            driver = webdriver.Chrome(service=service, options=options)
+            return driver, temp_profile
+        except SessionNotCreatedException as e:
+            last_err = e
+            # Clean temp dir and retry with a new one
+            try:
+                shutil.rmtree(temp_profile, ignore_errors=True)
+            except Exception:
+                pass
+            if attempt <= retries:
+                print(f"⚠️ SessionNotCreatedException (profile lock). Retrying ({attempt}/{retries})...")
+                time.sleep(1.5)
+                continue
+            else:
+                raise
+        except Exception as e:
+            last_err = e
+            # Other init errors (e.g., no Chrome in container)
+            try:
+                shutil.rmtree(temp_profile, ignore_errors=True)
+            except Exception:
+                pass
+            raise
+    # Shouldn’t reach here
+    if last_err:
+        raise last_err
 
 # ===================================
-# 2️⃣ NAVIGATE TO PROFILE
+# MAIN
 # ===================================
-driver.get(PROFILE_URL)
-print("✅ Profile page loaded")
-time.sleep(5)
+if __name__ == "__main__":
+    # Prepare date window
+    start_dt = datetime.strptime(START_DATE, "%Y-%m-%d")
+    end_dt   = datetime.strptime(END_DATE, "%Y-%m-%d")
 
-# ===================================
-# 3️⃣ CLICK FIRST POST
-# ===================================
-first_post_xpath = '/html/body/div[1]/div/div/div[2]/div/div/div[1]/div[2]/div[1]/section/main/div/div/div[2]/div/div/div/div/div[1]/div[1]/a'
+    # Spin up browser
+    driver, profile_dir = create_driver_with_retry()
+    wait = WebDriverWait(driver, 15)
 
-try:
-    first_post = wait.until(EC.presence_of_element_located((By.XPATH, first_post_xpath)))
-    driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", first_post)
-    time.sleep(2)
-    driver.execute_script("arguments[0].click();", first_post)
-    print("✅ Clicked first post")
-    time.sleep(3)
-except Exception as e:
-    print(f"⚠️ Error clicking first post: {e}")
-    driver.save_screenshot("click_error.png")
-    driver.quit()
-    exit()
+    # 1) LOGIN
+    driver.get("https://www.instagram.com/")
+    print("🔄 Opening Instagram...")
 
-# ===================================
-# 4️⃣ SCRAPE POSTS
-# ===================================
-data = []
-
-# Convert dates to datetime objects
-start_dt = datetime.strptime(START_DATE, "%Y-%m-%d")
-end_dt = datetime.strptime(END_DATE, "%Y-%m-%d")
-
-post_count = 0
-stop_scraping = False
-
-while not stop_scraping:
-    post_count += 1
-    print(f"\n📸 Scraping Post {post_count}")
     try:
+        username_input = wait.until(EC.presence_of_element_located((By.NAME, "username")))
+        password_input = driver.find_element(By.NAME, "password")
+        username_input.clear()
+        password_input.clear()
+        username_input.send_keys(INSTAGRAM_USERNAME)
+        password_input.send_keys(INSTAGRAM_PASSWORD)
+
+        login_button = driver.find_element(By.XPATH, '//button[@type="submit"]')
+        login_button.click()
+        print("✅ Submitted login form")
+
+        # Wait for either the home feed or profile avatar to appear
+        # (IG DOM changes often; this is a simple but effective readiness check)
+        try:
+            wait.until(
+                EC.any_of(
+                    EC.presence_of_element_located((By.XPATH, '//a[contains(@href, "/accounts/edit/")]')),
+                    EC.presence_of_element_located((By.XPATH, '//img[contains(@alt, "Profile") or contains(@alt, "profile")]')),
+                    EC.presence_of_element_located((By.XPATH, '//nav'))
+                )
+            )
+        except TimeoutException:
+            print("⚠️ Login may have 2FA or checkpoint. Proceeding to profile anyway.")
+        time.sleep(3)
+    except Exception as e:
+        print(f"⚠️ Login error: {e}")
+        driver.quit()
+        raise SystemExit(1)
+
+    # 2) NAVIGATE TO PROFILE
+    driver.get(PROFILE_URL)
+    print("✅ Profile page loaded")
+    time.sleep(4)
+
+    # 3) OPEN FIRST POST (use a slightly more flexible selector than a brittle absolute XPath)
+    # Try common layout: first grid anchor under the <article> (posts grid)
+    first_post = None
+    try:
+        # Many profile pages render posts inside an <article> tag; find first link
+        first_post = wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "article a"))
+        )
+        driver.execute_script("arguments[0].scrollIntoView({behavior:'instant',block:'center'});", first_post)
+        time.sleep(0.5)
+        driver.execute_script("arguments[0].click();", first_post)
+        print("✅ Clicked first post")
+        time.sleep(2.5)
+    except Exception as e:
+        print(f"⚠️ Error clicking first post: {e}")
+        driver.save_screenshot("/tmp/click_error.png")
+        driver.quit()
+        raise SystemExit(1)
+
+    # 4) SCRAPE POSTS
+    rows = []
+    post_count = 0
+
+    def get_post_date_iso() -> tuple[str, datetime | None]:
+        try:
+            t = driver.find_element(By.TAG_NAME, "time")
+            # time[datetime] is ISO like "2025-10-07T13:23:11.000Z"
+            iso = t.get_attribute("datetime")
+            date_str = iso[:10] if iso else "Unknown"
+            dt_obj = None
+            if date_str and date_str != "Unknown":
+                dt_obj = datetime.fromisoformat(date_str)
+            return date_str, dt_obj
+        except NoSuchElementException:
+            return "Unknown", None
+
+    stop = False
+    while not stop:
+        post_count += 1
+        print(f"\n📸 Scraping Post {post_count}")
+
         post_url = driver.current_url
 
-        # --- Date ---
-        try:
-            date_element = driver.find_element(By.XPATH, '//time')
-            date_posted = date_element.get_attribute("datetime")[:10]
-            date_obj = datetime.fromisoformat(date_posted).date()
-        except NoSuchElementException:
-            date_posted = "Unknown"
-            date_obj = None
+        # Date
+        date_posted, date_obj = get_post_date_iso()
 
-        # --- Date range check from 4th post onwards ---
-        if post_count > 3 and date_obj and date_obj < start_dt.date():
+        # Early stop if older than start window after first few posts (speeds up)
+        if post_count > 3 and date_obj and date_obj.date() < start_dt.date():
             print(f"🛑 Post {post_count} is older than start date ({START_DATE}). Stopping scrape.")
             break
 
-        # --- Likes ---
+        # Likes (often hidden for some accounts)
         try:
-            likes = driver.find_element(By.XPATH, '//section[2]/div/div/span/a/span/span').text
+            # This often changes; attempt a generic likes counter
+            likes = driver.find_element(By.XPATH, '//section//span//*[contains(text(),"likes")]/..').text
         except NoSuchElementException:
-            likes = "Hidden"
-
-        # --- Caption and Comments ---
-        all_comments_data = []
-        try:
-            comments_container = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.XPATH, '/html/body/div[4]/div[1]/div/div[3]/div/div/div/div/div[2]/div/article/div/div[2]/div/div/div[2]/div[1]/ul/div[3]/div/div'))
-            )
-
-            # Caption
             try:
-                caption_elem = comments_container.find_element(By.XPATH, '/html/body/div[4]/div[1]/div/div[3]/div/div/div/div/div[2]/div/article/div/div[2]/div/div/div[2]/div[1]/ul/div[1]/li/div/div/div[2]/div[1]/h1')
-                caption_text = caption_elem.text.strip()
-                all_comments_data.append(caption_text)
-                scraped_comments = set(all_comments_data)
-                print(f"📝 Caption: {caption_text}")
+                likes = driver.find_element(By.XPATH, '//section//button[contains(.," likes")]').text
             except NoSuchElementException:
-                caption_text = "N/A"
-                scraped_comments = set()
+                likes = "Hidden"
 
-            # Load comments
-            while True:
-                comment_blocks = comments_container.find_elements(By.XPATH, './div[position()>=1]/ul/div/li/div/div/div[2]/div[1]/span')
-                new_comment_found = False
-                for comment_elem in comment_blocks:
-                    try:
-                        comment_text = comment_elem.text.strip()
-                        if comment_text not in scraped_comments:
-                            all_comments_data.append(comment_text)
-                            scraped_comments.add(comment_text)
-                            print(f"💬 Comment: {comment_text}")
-                            new_comment_found = True
-                    except Exception:
-                        continue
+        # Caption + comments (best-effort; IG DOM changes frequently)
+        all_comments = []
+        try:
+            # Try to locate the main article area that contains caption/comments
+            article = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "article")))
+            # Caption h1 (if present)
+            try:
+                caption_elem = article.find_element(By.XPATH, './/h1')
+                cap_text = caption_elem.text.strip()
+                if cap_text:
+                    all_comments.append(cap_text)
+            except NoSuchElementException:
+                pass
 
-                if comment_blocks:
-                    driver.execute_script("arguments[0].scrollIntoView(true);", comment_blocks[-1])
-                    time.sleep(1.5)
+            # Comment spans
+            # This XPath tries to grab comment text blocks commonly used
+            comment_spans = article.find_elements(By.XPATH, './/ul//span[normalize-space()]')
+            for sp in comment_spans:
+                t = sp.text.strip()
+                if t:
+                    all_comments.append(t)
 
-                try:
-                    load_more_btn = comments_container.find_element(By.XPATH, './li/div/button')
-                    driver.execute_script("arguments[0].click();", load_more_btn)
-                    time.sleep(2)
-                    new_comment_found = True
-                except NoSuchElementException:
-                    pass
-
-                if not new_comment_found:
-                    break
+            # Deduplicate while preserving order
+            seen = set()
+            deduped = []
+            for c in all_comments:
+                if c not in seen:
+                    seen.add(c)
+                    deduped.append(c)
+            all_comments = deduped
 
         except Exception:
-            print("⚠️ Comments div not found")
+            print("⚠️ Could not parse caption/comments on this post.")
 
-        # --- Save post data ---
-        first_row = True
-        for comment in all_comments_data:
-            if first_row:
-                data.append({
-                    "Post_Number": post_count,
-                    "URL": post_url,
-                    "Date": date_posted,
-                    "Likes": likes,
-                    "Comment": comment
-                })
-                first_row = False
-            else:
-                data.append({
-                    "Post_Number": "",
-                    "URL": "",
-                    "Date": "",
-                    "Likes": "",
-                    "Comment": comment
-                })
+        # Save rows (first row has metadata, next rows only comment text)
+        if not all_comments:
+            rows.append({"Post_Number": post_count, "URL": post_url, "Date": date_posted, "Likes": likes, "Comment": ""})
+        else:
+            first = True
+            for c in all_comments:
+                if first:
+                    rows.append({"Post_Number": post_count, "URL": post_url, "Date": date_posted, "Likes": likes, "Comment": c})
+                    first = False
+                else:
+                    rows.append({"Post_Number": "", "URL": "", "Date": "", "Likes": "", "Comment": c})
 
-        print(f"✅ Scraped {len(all_comments_data)} comments for Post {post_count}")
+        print(f"✅ Scraped {len(all_comments)} comments for Post {post_count}")
 
-        # --- Next post ---
+        # Move next
         try:
+            # Next arrow button is usually a button inside overlay; look for generic next button class
             next_btn = wait.until(EC.element_to_be_clickable(
-                (By.XPATH, '//div[contains(@class, "_aaqg") and contains(@class, "_aaqh")]//button[contains(@class, "_abl-")]')
+                (By.XPATH, '//button[contains(@class,"_abl-")]//div/*[local-name()="svg" and @aria-label="Next"] | //button[contains(@class,"_abl-")][last()]')
             ))
             driver.execute_script("arguments[0].click();", next_btn)
-            time.sleep(random.uniform(3, 5))
+            time.sleep(random.uniform(2.8, 4.2))
         except TimeoutException:
             print("⚠️ Next button not found, stopping.")
-            break
+            stop = True
 
-    except Exception as e:
-        print(f"⚠️ Error scraping post {post_count}: {e}")
-        continue
+    # Filter by date window (keep rows whose first (metadata) row is within range)
+    if rows:
+        df = pd.DataFrame(rows)
+        # Propagate metadata down grouped blocks to filter cleanly
+        df["Date_filled"] = df["Date"].replace("", pd.NA).ffill()
+        df["URL_filled"] = df["URL"].replace("", pd.NA).ffill()
 
-# ===================================
-# 5️⃣ SAVE TO CSV
-# ===================================
-if data:
-    df = pd.DataFrame(data)
-    df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
-    print(f"\n✅ Data saved to {OUTPUT_FILE} (Rows: {len(df)})")
-else:
-    print("\n⚠️ No data scraped.")
+        def in_window(dstr: str) -> bool:
+            if not dstr or dstr == "Unknown":
+                return False
+            try:
+                d = datetime.strptime(dstr, "%Y-%m-%d")
+            except Exception:
+                return False
+            return start_dt.date() <= d.date() <= end_dt.date()
 
-driver.quit()
-print("\n✅ Scraping completed successfully!")
+        keep_urls = set(df[df["Date_filled"].apply(in_window)]["URL_filled"].dropna().unique())
+        df = df[df["URL_filled"].isin(keep_urls)].drop(columns=["Date_filled","URL_filled"])
+
+        # Save
+        out_path = OUTPUT_FILE
+        df.to_csv(out_path, index=False, encoding="utf-8-sig")
+        print(f"\n✅ Data saved to {out_path} (Rows: {len(df)})")
+    else:
+        print("\n⚠️ No data scraped.")
+
+    driver.quit()
+    # temp profile gets cleaned up by atexit
+    print("\n✅ Scraping completed successfully!")
