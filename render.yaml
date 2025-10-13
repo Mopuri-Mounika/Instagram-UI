@@ -6,7 +6,6 @@ services:
     autoDeploy: false
     dockerfilePath: Dockerfile
 
-    # Optional: attach a persistent disk so your CSV survives restarts
     disks:
       - name: data
         mountPath: /data
@@ -14,9 +13,9 @@ services:
 
     envVars:
       - key: INSTAGRAM_USERNAME
-        sync: false            # set in Render Dashboard
+        sync: false        # set securely in the Render dashboard
       - key: INSTAGRAM_PASSWORD
-        sync: false            # set in Render Dashboard
+        sync: false
       - key: PROFILE_URL
         value: https://www.instagram.com/srija_sweetiee/
       - key: START_DATE
