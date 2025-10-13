@@ -14,8 +14,8 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException
 # ===================================
 # CONFIGURATION
 # ===================================
-INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME") or "adiadiadi1044"
-INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD") or "Heybro@"
+INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME") 
+INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD")
 PROFILE_URL = "https://www.instagram.com/srija_sweetiee/"
 OUTPUT_FILE = "Srija_posts.csv"
 
