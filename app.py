@@ -1,5 +1,14 @@
-# app.py
-import os, time, random, tempfile, uuid
+# app.py — Render-ready Instagram scraper (Selenium + Chromium)
+# - Robust login: cookie-banner killer, selector fallbacks, retries
+# - Optional cookie-based login via IG_SESSIONID to bypass login form
+# - Unique Chrome profile per run to avoid "user data directory in use"
+# - Saves CSV to /data (attach a Render Disk for persistence)
+
+import os
+import time
+import random
+import tempfile
+import uuid
 from datetime import datetime
 import pandas as pd
 
@@ -11,21 +20,20 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
 
-# ================== CONFIG FROM ENV ==================
+# ================== CONFIG (env-driven) ==================
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
 PROFILE_URL       = os.getenv("PROFILE_URL", "https://www.instagram.com/srija_sweetiee/")
 OUTPUT_FILE       = os.getenv("OUTPUT_FILE", "/data/Srija_posts.csv")
-START_DATE        = os.getenv("START_DATE", "2025-09-29")
-END_DATE          = os.getenv("END_DATE", "2025-10-10")
+START_DATE        = os.getenv("START_DATE", "2025-09-29")  # yyyy-mm-dd
+END_DATE          = os.getenv("END_DATE",   "2025-10-10")  # yyyy-mm-dd
+IG_SESSIONID      = os.getenv("IG_SESSIONID", "")          # optional: cookie login
 
-assert INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD, "Set INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD env vars."
-
-# Convert date strings early (fail fast if wrong format)
+# Fail fast on bad dates
 start_dt = datetime.strptime(START_DATE, "%Y-%m-%d").date()
-end_dt   = datetime.strptime(END_DATE, "%Y-%m-%d").date()
+end_dt   = datetime.strptime(END_DATE,   "%Y-%m-%d").date()
 
-# ================== CHROME OPTIONS (Render-safe) ==================
+# ================== CHROME (Render-safe) ==================
 chrome_options = Options()
 chrome_options.add_argument("--headless=new")
 chrome_options.add_argument("--no-sandbox")
@@ -44,45 +52,157 @@ chrome_options.add_argument(
     "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
 )
 
-# ✅ UNIQUE user-data-dir to avoid “already in use” lock
+# Unique user-data-dir to avoid profile lock
 user_data_dir = os.path.join(tempfile.gettempdir(), f"chrome-user-data-{uuid.uuid4().hex}")
 chrome_options.add_argument(f"--user-data-dir={user_data_dir}")
 
-# If Dockerfile sets CHROME_BIN/CHROMEDRIVER, Selenium will use them automatically
+# CHROME_BIN / CHROMEDRIVER are set in Dockerfile; Selenium Manager is also fine
 service = Service()
 driver = webdriver.Chrome(service=service, options=chrome_options)
 wait = WebDriverWait(driver, 20)
 
-def login():
-    print("🔐 Logging in…")
-    driver.get("https://www.instagram.com/accounts/login/")
-    time.sleep(4)
-    try:
-        u = wait.until(EC.presence_of_element_located((By.NAME, "username")))
-        p = wait.until(EC.presence_of_element_located((By.NAME, "password")))
-        u.clear(); p.clear()
-        u.send_keys(INSTAGRAM_USERNAME)
-        p.send_keys(INSTAGRAM_PASSWORD)
-        wait.until(EC.element_to_be_clickable((By.XPATH, '//button[@type="submit"]'))).click()
-        time.sleep(7)
-        print("✅ Logged in.")
-    except TimeoutException:
-        raise SystemExit("❌ Could not locate login form (DOM changed or blocked).")
 
+# ================== UTILITIES ==================
+def _save_debug(prefix="debug"):
+    """Dump current page HTML + PNG to /data for debugging."""
+    try:
+        os.makedirs("/data", exist_ok=True)
+        html_path = f"/data/{prefix}.html"
+        png_path  = f"/data/{prefix}.png"
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        driver.save_screenshot(png_path)
+        print(f"🧪 Saved debug artifacts: {html_path}, {png_path}")
+    except Exception as e:
+        print(f"⚠️ Could not save debug artifacts: {e}")
+
+
+def _dismiss_cookie_banners():
+    texts = [
+        "Allow all cookies", "Only allow essential cookies", "Accept All",
+        "Accept", "Allow All", "Agree", "Got it", "OK"
+    ]
+    xpaths = [
+        '//button[contains(translate(., "ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"), "{}")]'.format(t.lower())
+        for t in texts
+    ]
+    for xp in xpaths:
+        try:
+            b = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.XPATH, xp)))
+            driver.execute_script("arguments[0].click();", b)
+            time.sleep(1.0)
+            break
+        except Exception:
+            pass
+
+
+def _find_login_inputs(timeout=8):
+    pairs = [
+        (By.NAME, "username"), (By.CSS_SELECTOR, 'input[name="username"]'),
+        (By.XPATH, '//input[@name="username"]')
+    ]
+    for by, val in pairs:
+        try:
+            u = WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, val)))
+            p = driver.find_element(By.NAME, "password")
+            return u, p
+        except Exception:
+            continue
+    return None, None
+
+
+# ================== AUTH ==================
+def bootstrap_with_cookie() -> bool:
+    """Login by setting session cookie (best reliability on cloud IPs)."""
+    if not IG_SESSIONID:
+        return False
+    print("🍪 Using IG_SESSIONID cookie login…")
+    driver.get("https://www.instagram.com/")
+    time.sleep(2)
+    try:
+        driver.add_cookie({
+            "name": "sessionid",
+            "value": IG_SESSIONID,
+            "domain": ".instagram.com",
+            "path": "/",
+            "httpOnly": True,
+            "secure": True
+        })
+        driver.refresh()
+        time.sleep(3)
+        if "accounts/login" not in driver.current_url:
+            print("✅ Cookie login successful.")
+            return True
+    except Exception as e:
+        print(f"⚠️ Cookie login failed: {e}")
+    return False
+
+
+def login_with_form():
+    print("🔐 Logging in via form…")
+    attempts = 0
+    while attempts < 3:
+        attempts += 1
+        driver.get("https://www.instagram.com/accounts/login/?hl=en")
+        time.sleep(4)
+        _dismiss_cookie_banners()
+
+        # Sometimes a home page shows with "Log in" link; try it:
+        if "accounts/login" not in driver.current_url:
+            try:
+                link = WebDriverWait(driver, 3).until(
+                    EC.element_to_be_clickable((By.XPATH, '//a[contains(@href,"/accounts/login/")]'))
+                )
+                driver.execute_script("arguments[0].click();", link)
+                time.sleep(3)
+            except Exception:
+                pass
+
+        u, p = _find_login_inputs(timeout=8)
+        if u and p:
+            try:
+                u.clear(); p.clear()
+                if not INSTAGRAM_USERNAME or not INSTAGRAM_PASSWORD:
+                    raise SystemExit("❌ Set INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD env vars.")
+                u.send_keys(INSTAGRAM_USERNAME)
+                p.send_keys(INSTAGRAM_PASSWORD)
+                WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, '//button[@type="submit"]'))
+                ).click()
+                time.sleep(7)
+
+                # Sanity check
+                driver.get("https://www.instagram.com/")
+                time.sleep(4)
+                if "accounts/login" not in driver.current_url:
+                    print("✅ Logged in.")
+                    return
+            except Exception:
+                pass
+
+        print(f"⚠️ Login attempt {attempts} failed; retrying…")
+        time.sleep(3)
+
+    _save_debug("login_fail")
+    raise SystemExit("❌ Could not locate/complete login form. See /data/login_fail.*")
+
+
+# ================== NAVIGATION & SCRAPE ==================
 def open_first_post():
-    print("🌐 Opening profile…", PROFILE_URL)
+    print(f"🌐 Opening profile: {PROFILE_URL}")
     driver.get(PROFILE_URL)
     time.sleep(5)
-    # Try to click the first post tile.
-    # Note: Instagram DOM changes often; this selector works for now but may need adjustments.
+    _dismiss_cookie_banners()
+
+    # Open first tile (anchor to post/reel)
+    # This fallback picks the first visible post or reel link on the grid/modal page.
     candidates = [
-        # grid v1
         '//a[contains(@href, "/p/") or contains(@href,"/reel/")]',
     ]
     for xp in candidates:
         try:
             elem = wait.until(EC.presence_of_element_located((By.XPATH, xp)))
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
+            driver.execute_script("arguments[0].scrollIntoView({block: " '"center"});', elem)
             time.sleep(1.5)
             driver.execute_script("arguments[0].click();", elem)
             time.sleep(3)
@@ -90,29 +210,30 @@ def open_first_post():
             return
         except Exception:
             continue
+    _save_debug("first_post_fail")
     raise SystemExit("❌ Could not open first post (selector drift).")
 
+
 def scrape():
-    data = []
+    print("🧹 Starting scrape…")
+    rows = []
     post_count = 0
 
     while True:
         post_count += 1
-        print(f"\n📸 Scraping Post {post_count}")
-
-        # Current post URL
+        print(f"\n📸 Post {post_count}")
         post_url = driver.current_url
 
         # Date
         try:
-            date_element = wait.until(EC.presence_of_element_located((By.TAG_NAME, "time")))
-            date_posted = date_element.get_attribute("datetime")[:10]  # yyyy-mm-dd
+            date_el = wait.until(EC.presence_of_element_located((By.TAG_NAME, "time")))
+            date_posted = date_el.get_attribute("datetime")[:10]  # yyyy-mm-dd
             date_obj = datetime.fromisoformat(date_posted).date()
         except Exception:
             date_posted = "Unknown"
             date_obj = None
 
-        # Stop if older than START_DATE (after we’ve moved a bit)
+        # Stop if older than START_DATE after a few posts
         if post_count > 3 and date_obj and date_obj < start_dt:
             print(f"🛑 Older than {START_DATE}. Stopping.")
             break
@@ -123,58 +244,53 @@ def scrape():
         except NoSuchElementException:
             likes = "Hidden"
 
-        # Caption + Comments (best-effort; DOM often changes)
-        all_comments = []
-        try:
-            # Caption (post owner)
-            cap_candidates = [
-                '//h1',                          # new layout
-                '//div[@role="dialog"]//h1',     # modal layout
-            ]
-            caption_text = "N/A"
-            for xp in cap_candidates:
-                try:
-                    caption_text = driver.find_element(By.XPATH, xp).text.strip()
+        # Caption (best-effort; DOM changes frequently)
+        caption_text = ""
+        for xp in ['//div[@role="dialog"]//h1', '//h1']:
+            try:
+                caption_text = driver.find_element(By.XPATH, xp).text.strip()
+                if caption_text:
                     break
-                except Exception:
-                    pass
-            if caption_text and caption_text != "N/A":
-                all_comments.append(caption_text)
-        except Exception:
-            pass
+            except Exception:
+                pass
 
-        # Save one row (comments elided for brevity)
-        data.append({
+        rows.append({
             "Post_Number": post_count,
             "URL": post_url,
             "Date": date_posted,
             "Likes": likes,
-            "Comment": caption_text if caption_text else ""
+            "Comment": caption_text
         })
 
-        # Next button
+        # Next button (modal or inline)
         try:
-            next_btn = wait.until(EC.element_to_be_clickable(
-                (By.XPATH, '//button[contains(@class,"_abl-") and @aria-label="Next"] | //div[@role="dialog"]//button[@aria-label="Next"]')
-            ))
+            next_btn = wait.until(EC.element_to_be_clickable((
+                By.XPATH,
+                '//button[@aria-label="Next" and contains(@class,"_abl-")] | '
+                '//div[@role="dialog"]//button[@aria-label="Next"]'
+            )))
             driver.execute_script("arguments[0].click();", next_btn)
             time.sleep(random.uniform(2.5, 4.5))
         except TimeoutException:
             print("⚠️ Next button not found. Stopping.")
             break
 
-    # Save
-    if data:
+    # Save CSV
+    if rows:
         os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-        df = pd.DataFrame(data)
+        df = pd.DataFrame(rows)
         df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
         print(f"\n✅ Saved {len(df)} rows to {OUTPUT_FILE}")
     else:
         print("\n⚠️ No data scraped.")
 
+
+# ================== MAIN ==================
 if __name__ == "__main__":
     try:
-        login()
+        # Prefer cookie login if provided; otherwise use form login
+        if not bootstrap_with_cookie():
+            login_with_form()
         open_first_post()
         scrape()
     finally:
